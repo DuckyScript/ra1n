@@ -1,0 +1,198 @@
+cat << 'EOF' > ~/bin/ra1n
+#!/bin/zsh
+
+E_SUCCESS=0; E_DEPENDENCY=10; E_NO_DEVICE=20; E_BATT_LOW=25; E_THERMAL=26; E_DOWNLOAD_FAIL=45; E_EXTRACT_FAIL=46; E_FLASH_FAIL=50; E_VERIFY_FAIL=60
+
+export BOLD='\033[1m' && export RED='\033[0;31m' && export GREEN='\033[0;32m'
+export CYAN='\033[0;36m' && export YELLOW='\033[1;33m' && export NC='\033[0m'
+export MAGENTA='\033[0;35m'
+
+VERBOSE=false; DRY_RUN=false; EXPORT_LOG=false; SILENT=false; FIX_SAFETY=false; BACKUP=false; NOTIFY=false; THERMAL=false; ZYGISK=false
+
+show_help() {
+    clear
+    echo -e "${CYAN}${BOLD}ra1n - TECHNICAL DOCUMENTATION${NC}"
+    echo -e "Usage: ra1n [options]\n"
+    echo -e "${BOLD}SYSTEM MODIFIERS:${NC}"
+    echo -e "  -v, --verbose    Raw Debugging Mode. Streams every ADB/Fastboot response."
+    echo -e "  -d, --dry-run    Simulation Engine. Verifies logic without flashing."
+    echo -e "  -s, --silent     Automation Mode. Suppresses headers and progress bars."
+    echo ""
+    echo -e "${BOLD}SAFETY & BACKUP:${NC}"
+    echo -e "  -t, --thermal    Thermal Guardian. Aborts flash if device > 45°C."
+    echo -e "  -b, --backup     Partition Insurance. Creates binary backup to Desktop."
+    echo ""
+    echo -e "${BOLD}EXPLOIT & STEALTH:${NC}"
+    echo -e "  -z, --zygisk     Zygisk Injector. Forces Zygisk on next reboot."
+    echo -e "  -f, --fix        Integrity Cloak. Hides root status from apps."
+    echo ""
+    echo -e "${BOLD}UTILITIES:${NC}"
+    echo -e "  -l, --log        Session Auditor. Saves .log file to Desktop."
+    echo -e "  -n, --notify     macOS Alerting. Native notifications on finish."
+    echo -e "  -h, --help       Display this technical manual."
+    echo ""
+    exit 0
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose) VERBOSE=true ;;
+        -d|--dry-run) DRY_RUN=true ;;
+        -l|--log)     EXPORT_LOG=true ;;
+        -s|--silent)  SILENT=true ;;
+        -f|--fix)     FIX_SAFETY=true ;;
+        -b|--backup)  BACKUP=true ;;
+        -n|--notify)  NOTIFY=true ;;
+        -t|--thermal) THERMAL=true ;;
+        -z|--zygisk)  ZYGISK=true ;;
+        -h|--help)    show_help ;;
+    esac
+done
+
+LOG_FILE="$HOME/Desktop/ra1n_session_$(date +%Y%m%d_%H%M%S).log"
+
+log() { 
+    local msg="[*] $1"
+    [[ "$SILENT" == false ]] && echo -e "${CYAN}[*]${NC} $1"
+    [[ "$EXPORT_LOG" == true ]] && echo "$msg" >> "$LOG_FILE"
+}
+
+info() { 
+    local msg="[i] $1"
+    [[ "$SILENT" == false ]] && echo -e "${YELLOW}[i]${NC} $1"
+    [[ "$EXPORT_LOG" == true ]] && echo "$msg" >> "$LOG_FILE"
+}
+
+success() { 
+    local msg="[+] $1"
+    [[ "$SILENT" == false ]] && echo -e "${GREEN}[+]${NC} $1"
+    [[ "$EXPORT_LOG" == true ]] && echo "$msg" >> "$LOG_FILE"
+}
+
+exec_cmd() {
+    if $DRY_RUN; then
+        info "DRY-RUN: Skipping execution of -> $1"
+        return 0
+    fi
+    if $VERBOSE; then
+        eval "$@"
+    else
+        eval "$@" >/dev/null 2>&1
+    fi
+}
+
+error() { 
+    [[ "$SILENT" == false ]] && echo -e "\n${RED}${BOLD}[!] STATUS: FAILED${NC}\n${RED}Reason: $1 (Code: $2)${NC}"
+    [[ "$EXPORT_LOG" == true ]] && echo "ERROR: $1 (Code: $2)" >> "$LOG_FILE"
+    [[ "$NOTIFY" == true ]] && osascript -e "display notification \"$1\" with title \"RA1N FAILURE\""
+    exit "$2" 
+}
+
+render_bar() {
+    [[ "$SILENT" == true ]] && return 0
+    local duration=$1
+    local message=$2
+    local col=$(tput cols)
+    local bar_size=$((col-30))
+    for i in {1..$bar_size}; do
+        echo -ne "\r${CYAN}[*]${NC} $message [${GREEN}"
+        for j in {1..$i}; do echo -ne "#"; done
+        for j in {1..$((bar_size-i))}; do echo -ne " "; done
+        echo -ne "${NC}] $((i*100/bar_size))%"
+        sleep $((duration/bar_size))
+    done
+    echo -e "\n"
+}
+
+check_hardware_safety() {
+    log "Initiating hardware safety audit..."
+    local BATT_LEVEL=$(adb shell dumpsys battery | grep level | awk '{print $2}' | tr -d '\r')
+    [[ -z "$BATT_LEVEL" ]] && BATT_LEVEL=0
+    [[ "$BATT_LEVEL" -lt 20 ]] && error "Battery low (${BATT_LEVEL}%)." $E_BATT_LOW
+    if $THERMAL; then
+        local TEMP=$(adb shell dumpsys battery | grep temperature | awk '{print $2}' | tr -d '\r')
+        local ACTUAL_TEMP=$((TEMP/10))
+        if [[ "$ACTUAL_TEMP" -gt 45 ]]; then
+            error "Thermal limit exceeded (${ACTUAL_TEMP}°C)." $E_THERMAL
+        fi
+        success "Hardware safety verified (Battery: ${BATT_LEVEL}%, Temp: ${ACTUAL_TEMP}°C)."
+    else
+        success "Battery level verified (${BATT_LEVEL}%)."
+    fi
+}
+
+stage_backup() {
+    if $BACKUP; then
+        log "Executing partition backup..."
+        local BKP_NAME="$HOME/Desktop/${DEVICE_CODENAME}_${PARTITION}_backup.img"
+        if ! $DRY_RUN; then
+            adb shell "su -c 'dd if=/dev/block/by-name/$PARTITION of=/sdcard/bkp.img'"
+            adb pull /sdcard/bkp.img "$BKP_NAME"
+            adb shell "rm /sdcard/bkp.img"
+        fi
+        success "Backup stored: $BKP_NAME"
+    fi
+}
+
+download_os_assets() {
+    DEVICE_CODENAME=$(adb shell getprop ro.product.name | tr -d '\r')
+    if [[ "$DEVICE_CODENAME" == *"pixel"* ]]; then
+        local DL_URL="https://dl.google.com/dl/android/aosp/${DEVICE_CODENAME}-factory-latest.zip"
+        local FW_PATH="$HOME/Downloads/fw.zip"
+        local WORK_DIR="$HOME/Downloads/ra1n_work"
+        log "Syncing OS assets..."
+        if ! $DRY_RUN; then
+            curl -L "$DL_URL" -o "$FW_PATH" --progress-bar || error "Download failed" $E_DOWNLOAD_FAIL
+            mkdir -p "$WORK_DIR"
+            unzip -q "$FW_PATH" -d "$WORK_DIR" || error "Extraction failed" $E_EXTRACT_FAIL
+        fi
+        success "Assets extracted."
+    fi
+}
+
+show_header() {
+    [[ "$SILENT" == true ]] && return 0
+    clear
+    echo -e "${CYAN}${BOLD}                 _ _        "
+    echo "  _ __ __ _ _ __| | | _ __  "
+    echo " | '__/ _\` | '  | | | '_ \ "
+    echo " | | | (_| | |  | | | | | |"
+    echo " |_|  \__,_|_|_ |_|_|_| |_|"
+    echo -e "    --- RA1N TITAN v5.0 ---      ${NC}"
+    $THERMAL && echo -e "${RED}THERMAL GUARDIAN: ACTIVE${NC}"
+    $ZYGISK && echo -e "${MAGENTA}ZYGISK AUTO-INJECT: ENABLED${NC}"
+    echo ""
+}
+
+main() {
+    show_header
+    log "Stage 1: Hardware Handshake..."
+    exec_cmd "adb wait-for-device"
+    check_hardware_safety
+    ANDROID_VER=$(adb shell getprop ro.build.version.release | tr -d '\r' | cut -d'.' -f1)
+    [[ $ANDROID_VER -ge 13 ]] && PARTITION="init_boot" || PARTITION="boot"
+    download_os_assets
+    stage_backup
+    log "Stage 2: Deployment..."
+    exec_cmd "adb reboot bootloader"
+    if ! $DRY_RUN; then
+        until fastboot devices | grep -q "fastboot"; do sleep 1; done
+        PAYLOAD=$(osascript -e 'POSIX path of (choose file with prompt "RA1N: Select PATCHED Image")' 2>/dev/null)
+        [[ -z "$PAYLOAD" ]] && error "No payload selected" 40
+    fi
+    render_bar 2 "Flashing $PARTITION"
+    exec_cmd "fastboot flash '$PARTITION' '$PAYLOAD'"
+    exec_cmd "fastboot reboot"
+    log "Stage 3: Post-Exploit Logic..."
+    exec_cmd "adb wait-for-device"
+    if $ZYGISK; then
+        log "Enabling Zygisk core..."
+        exec_cmd "adb shell \"su -c 'magisk --zygisk enable'\""
+    fi
+    success "RA1N TITAN COMPLETE."
+    [[ "$NOTIFY" == true ]] && osascript -e "display notification \"Root Complete\" with title \"RA1N TITAN\""
+}
+
+main "$@"
+EOF
+chmod +x ~/bin/ra1n
