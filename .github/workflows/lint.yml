@@ -1,0 +1,25 @@
+name: ShellCheck Lint
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Extract embedded script
+        run: |
+          sed -n "/^#!/,/^EOF$/p" restore | head -n -1 > ra1n.sh
+          chmod +x ra1n.sh
+
+      - name: Run ShellCheck
+        run: shellcheck -s bash -S warning ra1n.sh
