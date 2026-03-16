@@ -17,15 +17,21 @@ E_FLASH_FAIL=50
 E_VERIFY_FAIL=60
 E_TIMEOUT=70
 E_CONCURRENT=80
+E_CHECKSUM=85
+E_ROLLBACK=90
 
-# --- Colors ---
-BOLD='\033[1m'
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-MAGENTA='\033[0;35m'
-NC='\033[0m'
+# --- Color Auto-Detection ---
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    CYAN='\033[0;36m'
+    YELLOW='\033[1;33m'
+    MAGENTA='\033[0;35m'
+    NC='\033[0m'
+else
+    BOLD='' RED='' GREEN='' CYAN='' YELLOW='' MAGENTA='' NC=''
+fi
 
 # --- Defaults ---
 VERBOSE=false
@@ -37,11 +43,15 @@ BACKUP=false
 NOTIFY=false
 THERMAL=false
 ZYGISK=false
+SKIP_CONFIRM=false
 
-VERSION="6.0"
+VERSION="7.0"
 LOCK_FILE="/tmp/ra1n.lock"
 WORK_DIR=""
 FW_PATH=""
+BACKUP_FILE=""
+MAX_RETRIES=3
+RETRY_DELAY=2
 
 # --- Cleanup ---
 cleanup() {
@@ -58,31 +68,58 @@ trap cleanup EXIT
 trap 'error "Interrupted by user" 130' INT TERM
 
 # --- Logging ---
+_log_to_file() {
+    [[ "$EXPORT_LOG" == true ]] && echo "$(date '+%H:%M:%S') $1" >> "$LOG_FILE"
+}
+
 log() {
-    local msg="[*] $1"
     [[ "$SILENT" == false ]] && echo -e "${CYAN}[*]${NC} $1"
-    [[ "$EXPORT_LOG" == true ]] && echo "$(date '+%H:%M:%S') $msg" >> "$LOG_FILE"
+    _log_to_file "[*] $1"
 }
 
 info() {
-    local msg="[i] $1"
     [[ "$SILENT" == false ]] && echo -e "${YELLOW}[i]${NC} $1"
-    [[ "$EXPORT_LOG" == true ]] && echo "$(date '+%H:%M:%S') $msg" >> "$LOG_FILE"
+    _log_to_file "[i] $1"
 }
 
 success() {
-    local msg="[+] $1"
     [[ "$SILENT" == false ]] && echo -e "${GREEN}[+]${NC} $1"
-    [[ "$EXPORT_LOG" == true ]] && echo "$(date '+%H:%M:%S') $msg" >> "$LOG_FILE"
+    _log_to_file "[+] $1"
+}
+
+warn() {
+    [[ "$SILENT" == false ]] && echo -e "${YELLOW}${BOLD}[!]${NC} $1"
+    _log_to_file "[!] $1"
 }
 
 error() {
     [[ "$SILENT" == false ]] && echo -e "\n${RED}${BOLD}[!] STATUS: FAILED${NC}\n${RED}Reason: $1 (Code: $2)${NC}"
-    [[ "$EXPORT_LOG" == true ]] && echo "$(date '+%H:%M:%S') ERROR: $1 (Code: $2)" >> "$LOG_FILE"
+    _log_to_file "ERROR: $1 (Code: $2)"
     if [[ "$NOTIFY" == true ]]; then
         osascript -e "display notification \"$1\" with title \"RA1N FAILURE\"" 2>/dev/null
     fi
     exit "$2"
+}
+
+# --- Retry Wrapper ---
+retry() {
+    local max_attempts=${1}
+    shift
+    local attempt=1
+    local delay=$RETRY_DELAY
+
+    while [[ $attempt -le $max_attempts ]]; do
+        if "$@"; then
+            return 0
+        fi
+        if [[ $attempt -lt $max_attempts ]]; then
+            warn "Command failed (attempt $attempt/$max_attempts), retrying in ${delay}s..."
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
 }
 
 # --- Command Execution (no eval) ---
@@ -98,6 +135,16 @@ exec_cmd() {
     fi
 }
 
+# --- User Confirmation ---
+confirm() {
+    $SKIP_CONFIRM && return 0
+    $SILENT && return 0
+    local prompt="${1:-Continue?}"
+    echo -ne "${YELLOW}[?]${NC} ${prompt} [y/N] "
+    read -r response
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
 # --- Help ---
 show_help() {
     clear
@@ -107,6 +154,7 @@ show_help() {
     echo -e "  -v, --verbose    Raw Debugging Mode. Streams every ADB/Fastboot response."
     echo -e "  -d, --dry-run    Simulation Engine. Verifies logic without flashing."
     echo -e "  -s, --silent     Automation Mode. Suppresses headers and progress bars."
+    echo -e "  -y, --yes        Skip all confirmation prompts."
     echo ""
     echo -e "${BOLD}SAFETY & BACKUP:${NC}"
     echo -e "  -t, --thermal    Thermal Guardian. Aborts flash if device > 45°C."
@@ -121,22 +169,55 @@ show_help() {
     echo -e "  -n, --notify     macOS Alerting. Native notifications on finish."
     echo -e "  -h, --help       Display this technical manual."
     echo ""
+    echo -e "${BOLD}EXAMPLES:${NC}"
+    echo -e "  ra1n -vtb        Verbose mode with thermal check and backup."
+    echo -e "  ra1n -d          Dry-run to verify logic without flashing."
+    echo -e "  ra1n -fz -y      Fix integrity + Zygisk, skip prompts."
+    echo ""
     exit 0
 }
 
-# --- Argument Parsing ---
+# --- Argument Parsing (supports combined short flags: -vtb) ---
+parse_flag() {
+    case "$1" in
+        v) VERBOSE=true ;;
+        d) DRY_RUN=true ;;
+        l) EXPORT_LOG=true ;;
+        s) SILENT=true ;;
+        f) FIX_SAFETY=true ;;
+        b) BACKUP=true ;;
+        n) NOTIFY=true ;;
+        t) THERMAL=true ;;
+        z) ZYGISK=true ;;
+        y) SKIP_CONFIRM=true ;;
+        h) show_help ;;
+        *)
+            echo -e "${RED}[!] Unknown flag: -$1${NC}"
+            echo "    Use -h or --help for usage information."
+            exit $E_UNKNOWN_ARG
+            ;;
+    esac
+}
+
 for arg in "$@"; do
     case "$arg" in
-        -v|--verbose) VERBOSE=true ;;
-        -d|--dry-run) DRY_RUN=true ;;
-        -l|--log)     EXPORT_LOG=true ;;
-        -s|--silent)  SILENT=true ;;
-        -f|--fix)     FIX_SAFETY=true ;;
-        -b|--backup)  BACKUP=true ;;
-        -n|--notify)  NOTIFY=true ;;
-        -t|--thermal) THERMAL=true ;;
-        -z|--zygisk)  ZYGISK=true ;;
-        -h|--help)    show_help ;;
+        --verbose)  VERBOSE=true ;;
+        --dry-run)  DRY_RUN=true ;;
+        --log)      EXPORT_LOG=true ;;
+        --silent)   SILENT=true ;;
+        --fix)      FIX_SAFETY=true ;;
+        --backup)   BACKUP=true ;;
+        --notify)   NOTIFY=true ;;
+        --thermal)  THERMAL=true ;;
+        --zygisk)   ZYGISK=true ;;
+        --yes)      SKIP_CONFIRM=true ;;
+        --help)     show_help ;;
+        -*)
+            local flags="${arg#-}"
+            for (( i=0; i<${#flags}; i++ )); do
+                parse_flag "${flags:$i:1}"
+            done
+            ;;
         *)
             echo -e "${RED}[!] Unknown argument: $arg${NC}"
             echo "    Use -h or --help for usage information."
@@ -147,16 +228,23 @@ done
 
 LOG_FILE="$HOME/Desktop/ra1n_session_$(date +%Y%m%d_%H%M%S).log"
 
-# --- Concurrency Lock ---
+# --- Stale Lock Detection ---
 if [[ -f "$LOCK_FILE" ]]; then
-    error "Another ra1n instance is running (lock: $LOCK_FILE)" $E_CONCURRENT
+    local stale_pid
+    stale_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [[ -n "$stale_pid" ]] && kill -0 "$stale_pid" 2>/dev/null; then
+        error "Another ra1n instance is running (PID: $stale_pid)" $E_CONCURRENT
+    else
+        warn "Removing stale lock file (PID $stale_pid no longer running)."
+        rm -f "$LOCK_FILE"
+    fi
 fi
 echo $$ > "$LOCK_FILE"
 
 # --- Dependency Check ---
 check_dependencies() {
     local missing=()
-    for cmd in adb fastboot curl unzip; do
+    for cmd in adb fastboot curl unzip shasum; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -241,35 +329,90 @@ check_hardware_safety() {
     fi
 }
 
+# --- Device Info Summary ---
+print_device_summary() {
+    log "Collecting device information..."
+    local model brand android_ver build_id serial
+    model=$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+    brand=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d '\r')
+    android_ver=$(adb shell getprop ro.build.version.release 2>/dev/null | tr -d '\r')
+    build_id=$(adb shell getprop ro.build.display.id 2>/dev/null | tr -d '\r')
+    serial=$(adb get-serialno 2>/dev/null | tr -d '\r')
+
+    echo ""
+    echo -e "${BOLD}  Device Summary${NC}"
+    echo -e "  ─────────────────────────────"
+    echo -e "  Brand:      ${CYAN}${brand}${NC}"
+    echo -e "  Model:      ${CYAN}${model}${NC}"
+    echo -e "  Android:    ${CYAN}${android_ver}${NC}"
+    echo -e "  Build:      ${CYAN}${build_id}${NC}"
+    echo -e "  Serial:     ${CYAN}${serial}${NC}"
+    echo ""
+    _log_to_file "Device: $brand $model | Android $android_ver | Build $build_id | Serial $serial"
+}
+
 # --- Partition Backup ---
 stage_backup() {
     if $BACKUP; then
         log "Executing partition backup..."
-        local BKP_NAME="$HOME/Desktop/${DEVICE_CODENAME}_${PARTITION}_backup_$(date +%Y%m%d_%H%M%S).img"
+        BACKUP_FILE="$HOME/Desktop/${DEVICE_CODENAME}_${PARTITION}_backup_$(date +%Y%m%d_%H%M%S).img"
         if ! $DRY_RUN; then
-            adb shell "su -c 'dd if=/dev/block/by-name/$PARTITION of=/sdcard/bkp.img'" \
-                || error "Backup dd failed" $E_FLASH_FAIL
-            adb pull /sdcard/bkp.img "$BKP_NAME" \
-                || error "Backup pull failed" $E_FLASH_FAIL
+            retry $MAX_RETRIES adb shell "su -c 'dd if=/dev/block/by-name/$PARTITION of=/sdcard/bkp.img'" \
+                || error "Backup dd failed after $MAX_RETRIES attempts" $E_FLASH_FAIL
+            retry $MAX_RETRIES adb pull /sdcard/bkp.img "$BACKUP_FILE" \
+                || error "Backup pull failed after $MAX_RETRIES attempts" $E_FLASH_FAIL
             adb shell "rm /sdcard/bkp.img"
         fi
-        success "Backup stored: $BKP_NAME"
+        success "Backup stored: $BACKUP_FILE"
     fi
 }
 
-# --- Download Factory Image ---
+# --- Rollback on Flash Failure ---
+rollback() {
+    if [[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE" ]]; then
+        warn "Attempting rollback from backup: $BACKUP_FILE"
+        if fastboot flash "$PARTITION" "$BACKUP_FILE"; then
+            fastboot reboot
+            success "Rollback completed successfully."
+        else
+            error "Rollback failed. Manual recovery required. Backup at: $BACKUP_FILE" $E_ROLLBACK
+        fi
+    else
+        warn "No backup available for rollback. Manual recovery required."
+    fi
+}
+
+# --- Download with Checksum Verification ---
 download_os_assets() {
     DEVICE_CODENAME=$(adb shell getprop ro.product.name 2>/dev/null | tr -d '\r')
     [[ -z "$DEVICE_CODENAME" ]] && error "Could not determine device codename" $E_NO_DEVICE
 
     if [[ "$DEVICE_CODENAME" == *"pixel"* ]]; then
         local DL_URL="https://dl.google.com/dl/android/aosp/${DEVICE_CODENAME}-factory-latest.zip"
+        local CHECKSUM_URL="${DL_URL}.sha256"
         FW_PATH="$HOME/Downloads/fw_$(date +%s).zip"
         WORK_DIR="$HOME/Downloads/ra1n_work_$$"
         log "Syncing OS assets for $DEVICE_CODENAME..."
         if ! $DRY_RUN; then
-            curl -fSL "$DL_URL" -o "$FW_PATH" --progress-bar \
+            retry $MAX_RETRIES curl -fSL "$DL_URL" -o "$FW_PATH" --progress-bar \
                 || error "Download failed from $DL_URL" $E_DOWNLOAD_FAIL
+
+            # Verify checksum if available
+            local expected_hash
+            expected_hash=$(curl -fsSL "$CHECKSUM_URL" 2>/dev/null | awk '{print $1}')
+            if [[ -n "$expected_hash" ]]; then
+                log "Verifying SHA-256 checksum..."
+                local actual_hash
+                actual_hash=$(shasum -a 256 "$FW_PATH" | awk '{print $1}')
+                if [[ "$expected_hash" != "$actual_hash" ]]; then
+                    rm -f "$FW_PATH"
+                    error "Checksum mismatch! Expected: $expected_hash Got: $actual_hash" $E_CHECKSUM
+                fi
+                success "Checksum verified."
+            else
+                info "No checksum available — skipping verification."
+            fi
+
             mkdir -p "$WORK_DIR"
             unzip -q "$FW_PATH" -d "$WORK_DIR" \
                 || error "Extraction failed" $E_EXTRACT_FAIL
@@ -317,13 +460,25 @@ verify_flash() {
     fi
 }
 
+# --- Elapsed Time ---
+format_elapsed() {
+    local seconds=$1
+    if [[ $seconds -ge 60 ]]; then
+        printf "%dm %ds" $((seconds / 60)) $((seconds % 60))
+    else
+        printf "%ds" "$seconds"
+    fi
+}
+
 # --- Main ---
 main() {
+    local start_time=$SECONDS
     show_header
     check_dependencies
 
     log "Stage 1: Hardware Handshake..."
     wait_for_device 60 "device"
+    print_device_summary
     check_hardware_safety
 
     local ANDROID_VER
@@ -336,6 +491,11 @@ main() {
     stage_backup
 
     log "Stage 2: Deployment..."
+
+    if ! confirm "Flash $PARTITION on $DEVICE_CODENAME? This cannot be undone without a backup."; then
+        error "Aborted by user" 1
+    fi
+
     exec_cmd adb reboot bootloader
     wait_for_device 90 "fastboot"
 
@@ -347,8 +507,11 @@ main() {
     fi
 
     render_bar 2 "Flashing $PARTITION"
-    exec_cmd fastboot flash "$PARTITION" "$PAYLOAD" \
-        || error "Flash failed for $PARTITION" $E_FLASH_FAIL
+    if ! exec_cmd fastboot flash "$PARTITION" "$PAYLOAD"; then
+        warn "Flash failed — initiating rollback..."
+        rollback
+        error "Flash failed for $PARTITION" $E_FLASH_FAIL
+    fi
     exec_cmd fastboot reboot
 
     log "Stage 3: Post-Exploit Logic..."
@@ -366,7 +529,8 @@ main() {
 
     verify_flash
 
-    success "RA1N TITAN v${VERSION} COMPLETE."
+    local elapsed=$((SECONDS - start_time))
+    success "RA1N TITAN v${VERSION} COMPLETE. ($(format_elapsed $elapsed))"
     [[ "$NOTIFY" == true ]] && osascript -e "display notification \"Root Complete\" with title \"RA1N TITAN v${VERSION}\"" 2>/dev/null
 }
 
