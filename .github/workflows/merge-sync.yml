@@ -1,0 +1,129 @@
+name: Merge Claude Branch & Sync
+
+on:
+  # Trigger manually from Actions tab
+  workflow_dispatch:
+    inputs:
+      claude_branch:
+        description: 'Claude branch to merge (e.g. claude/improve-script-9QJ7w)'
+        required: true
+        type: string
+      target_branch:
+        description: 'Target branch to merge into'
+        required: false
+        default: 'main'
+        type: string
+      create_release:
+        description: 'Create a release after merge'
+        required: false
+        default: false
+        type: boolean
+
+  # Auto-trigger when a claude/* branch is pushed
+  push:
+    branches:
+      - 'claude/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-and-sync:
+    name: Merge & Sync Branches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine branches
+        id: branches
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "claude=${{ inputs.claude_branch }}" >> "$GITHUB_OUTPUT"
+            echo "target=${{ inputs.target_branch }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "claude=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "target=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch all branches
+        run: |
+          git fetch origin "${{ steps.branches.outputs.claude }}"
+          git fetch origin "${{ steps.branches.outputs.target }}" || true
+
+      - name: Check for differences
+        id: diff
+        run: |
+          CLAUDE="${{ steps.branches.outputs.claude }}"
+          TARGET="${{ steps.branches.outputs.target }}"
+
+          if git rev-parse "origin/$TARGET" >/dev/null 2>&1; then
+            DIFF_COUNT=$(git rev-list --count "origin/$TARGET..origin/$CLAUDE" 2>/dev/null || echo "0")
+          else
+            DIFF_COUNT=$(git rev-list --count "origin/$CLAUDE" 2>/dev/null || echo "0")
+          fi
+
+          echo "diff_count=$DIFF_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $DIFF_COUNT new commit(s) to merge."
+
+          if [[ "$DIFF_COUNT" -eq 0 ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge claude branch into target
+        if: steps.diff.outputs.skip == 'false'
+        run: |
+          CLAUDE="${{ steps.branches.outputs.claude }}"
+          TARGET="${{ steps.branches.outputs.target }}"
+
+          # Create target branch if it doesn't exist
+          if ! git rev-parse "origin/$TARGET" >/dev/null 2>&1; then
+            git checkout -b "$TARGET" "origin/$CLAUDE"
+            git push origin "$TARGET"
+          else
+            git checkout "$TARGET"
+            git merge "origin/$CLAUDE" --no-ff \
+              -m "Merge $CLAUDE into $TARGET (${{ steps.diff.outputs.diff_count }} commits)"
+            git push origin "$TARGET"
+          fi
+
+      - name: Sync claude branch with target
+        if: steps.diff.outputs.skip == 'false'
+        run: |
+          CLAUDE="${{ steps.branches.outputs.claude }}"
+          TARGET="${{ steps.branches.outputs.target }}"
+
+          git checkout "$CLAUDE"
+          git merge "origin/$TARGET" -m "Sync $CLAUDE with $TARGET"
+          git push origin "$CLAUDE"
+
+          echo "Both branches are now in sync."
+
+      - name: Post summary
+        if: steps.diff.outputs.skip == 'false'
+        run: |
+          CLAUDE="${{ steps.branches.outputs.claude }}"
+          TARGET="${{ steps.branches.outputs.target }}"
+          echo "### Merge & Sync Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Direction | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`$CLAUDE\` → \`$TARGET\` | Merged (${{ steps.diff.outputs.diff_count }} commits) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`$TARGET\` → \`$CLAUDE\` | Synced |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Already in sync
+        if: steps.diff.outputs.skip == 'true'
+        run: |
+          echo "Branches are already in sync — nothing to merge."
+          echo "### Already in Sync" >> "$GITHUB_STEP_SUMMARY"
+          echo "No new commits to merge." >> "$GITHUB_STEP_SUMMARY"
